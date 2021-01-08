@@ -3,6 +3,7 @@
 venv/
 saves/*
 story*.json
+fifteen_api*.wav
 !*.gitkeep
 /prompts/*
 !/prompts/cloveranon-prompts/*

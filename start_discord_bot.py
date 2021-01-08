@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio, io, json, logging, os, random, re, sys, time, typing, uuid
+import concurrent.futures
 from datetime import datetime
 from logging.handlers import SysLogHandler
 
@@ -12,18 +13,25 @@ from utils import *
 
 import discord
 from discord.ext import commands
-from google.cloud import texttospeech
+from google.cloud import texttospeech_v1
+from google.cloud.texttospeech_v1.services.text_to_speech.transports.grpc import (
+    TextToSpeechGrpcTransport,
+)
+from fifteen_api import FifteenAPI
 import audioop
+from pydub import AudioSegment
 import azure.cognitiveservices.speech as speechsdk
 
 from slugify import slugify
 
 import requests
+import textwrap
 
 # bot setup
 bot = commands.Bot(command_prefix='!')
-ADMIN_ROLE = settings.get('discord-bot-admin-role', 'admin')
-CHANNEL = settings.get('discord-bot-channel', 'general')
+BOT_OWNER = settings.get('discord-bot-owner')
+ADMIN_ROLE = settings.get('discord-bot-admin-role')
+CHANNEL = settings.get('discord-bot-channel')
 DISCORD_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 EXAMPLE_CONTEXT = "You are Max Powers, Founder and CEO of Powers Incorporated."
 EXAMPLE_PROMPT = "Your quest for power and money on Earth has led to it's destruction.  You pour all your wealth into a space program.  You take your wife Rimes and move to Mars."
@@ -47,9 +55,17 @@ story = Story(generator, censor=True)
 queue = asyncio.Queue()
 
 # TTS setup
-client = texttospeech.TextToSpeechClient()
+tts_channel = TextToSpeechGrpcTransport.create_channel(
+    options=[("grpc.max_receive_message_length", 24 * 1024 * 1024)]
+)
+tts_transport = TextToSpeechGrpcTransport(channel=tts_channel)
+client = texttospeech_v1.TextToSpeechClient(transport=tts_transport)
+
+tts_api = FifteenAPI(show_debug=True)
 voice_client = None
-v2_voice_toggle = True
+v2_voice_toggle = False
+fifteen_voice_toggle = True
+fifteen_character = "Fluttershy"
 
 # stat tracker setup
 stats = {
@@ -75,6 +91,7 @@ logger.info('Worker instance started')
 @bot.event
 async def on_ready():
     global story
+    logger.info(f'Admin role: {ADMIN_ROLE}, Bot owner: {BOT_OWNER}')
     logger.info('Bot is ready')
     loop = asyncio.get_event_loop()
     while True:
@@ -154,10 +171,13 @@ async def handle_next(loop, channel, author, story_action):
         story.context = story_action
         await eplog(loop, story.context)
         if voice_client and voice_client.is_connected():
-            if v2_voice_toggle:
-                await bot_read_message_v2(loop, voice_client, story.context)
+            if fifteen_voice_toggle:
+                await bot_read_message_15ai(loop, voice_client, story.context)
             else:
-                await bot_read_message(voice_client, story.context)
+                if v2_voice_toggle:
+                    await bot_read_message_v2(loop, voice_client, story.context)
+                else:
+                    await bot_read_message(voice_client, story.context)
         await channel.send(f"Context set!\nProvide initial prompt with !next (Ex. {EXAMPLE_PROMPT})")
     else:
         if story_action != '':
@@ -167,10 +187,13 @@ async def handle_next(loop, channel, author, story_action):
         sent = f"{story_action}\n{escape(response)}"
         # handle tts if in a voice channel
         if voice_client and voice_client.is_connected():
-            if v2_voice_toggle:
-                await bot_read_message_v2(loop, voice_client, sent)
+            if fifteen_voice_toggle:
+                await bot_read_message_15ai(loop, voice_client, sent)
             else:
-                await bot_read_message(voice_client, sent)
+                if v2_voice_toggle:
+                    await bot_read_message_v2(loop, voice_client, sent)
+                else:
+                    await bot_read_message(voice_client, sent)
         # Note: ai_channel.send(sent, tts=True) is much easier than custom TTS, 
         # but it always appends "Bot says..." which gets annoying real fast and 
         # the voice isn't configurable
@@ -231,10 +254,13 @@ async def handle_loadgame(loop, channel, save_game_id):
         if last_result and len(last_result) > 0:
             game_load_message = game_load_message + f"\n{escape(last_result)}"
         if voice_client and voice_client.is_connected():
-            if v2_voice_toggle:
-                await bot_read_message_v2(loop, voice_client, game_load_message)
+            if fifteen_voice_toggle:
+                await bot_read_message_15ai(loop, voice_client, game_load_message)
             else:
-                await bot_read_message(voice_client, game_load_message)
+                if v2_voice_toggle:
+                    await bot_read_message_v2(loop, voice_client, game_load_message)
+                else:
+                    await bot_read_message(voice_client, game_load_message)
         await eplog(loop, f"\n>> {game_load_message}")
         await channel.send(f"> {game_load_message}")
     except FileNotFoundError:
@@ -284,16 +310,39 @@ async def bot_read_message(voice_client, message):
     Uses Google Cloud TTS.
     '''
     if voice_client and voice_client.is_connected():
-        synthesis_input = texttospeech.types.SynthesisInput(text=message)
-        voice = texttospeech.types.VoiceSelectionParams(
+        synthesis_input = texttospeech_v1.types.SynthesisInput(text=message)
+        voice = texttospeech_v1.types.VoiceSelectionParams(
             language_code='en-US', # required, options: 'en-US', 'en-IN', 'en-GB', 'en-AU', 'de-DE'
             name='en-US-Wavenet-F', # optional, options: https://cloud.google.com/text-to-speech/docs/voices, 'en-US-Wavenet-C', 'en-AU-Wavenet-C', 'en-GB-Wavenet-A', 'en-IN-Wavenet-A', 'de-DE-Wavenet-F'
-            ssml_gender=texttospeech.enums.SsmlVoiceGender.FEMALE)
-        audio_config = texttospeech.types.AudioConfig(
-            audio_encoding=texttospeech.enums.AudioEncoding.LINEAR16,
+            ssml_gender=texttospeech_v1.SsmlVoiceGender.FEMALE)
+        audio_config = texttospeech_v1.types.AudioConfig(
+            audio_encoding=texttospeech_v1.AudioEncoding.LINEAR16,
             sample_rate_hertz=96000)
-        response = client.synthesize_speech(synthesis_input, voice, audio_config)
+        response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
         voice_client.play(discord.PCMAudio(io.BytesIO(response.audio_content)))
+        while voice_client.is_playing():
+            await asyncio.sleep(1)
+        voice_client.stop()
+
+async def bot_read_message_15ai(loop, voice_client, message):
+    '''
+    Uses 15.ai
+    '''
+    if voice_client and voice_client.is_connected():
+        global fifteen_character
+        lines = textwrap.wrap(message, 495)
+        files = {}
+        output = AudioSegment.from_wav("template.wav")
+        i = 0
+        for line in lines:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                results = await loop.run_in_executor(executor, tts_api.save_to_file, fifteen_character, line, f"fifteen_api_{i}.wav")
+                files.update({f"sound{i}": results["filename"]})
+                i = i + 1
+        for file in files.values():
+            output = output + AudioSegment.from_wav(file)
+        output.export("fifteen_api.wav")
+        voice_client.play(discord.FFmpegPCMAudio(source='fifteen_api.wav', executable='ffmpeg.exe'))
         while voice_client.is_playing():
             await asyncio.sleep(1)
         voice_client.stop()
@@ -386,6 +435,11 @@ def is_in_channel():
         return ctx.message.channel.name == CHANNEL
     return commands.check(predicate)
 
+def is_bot_author():
+    async def predicate(ctx):
+        return ctx.message.author.id == int(BOT_OWNER)
+    return commands.check(predicate)
+
 
 def escape(text):
     return re.sub('[\\`*_<>]', '', text)
@@ -476,8 +530,8 @@ async def game_alter(ctx, *, altered_response):
     await queue.put(json.dumps(message))
 
 
-@bot.command(name='newgame', help='Starts a new game')
-@commands.has_role(ADMIN_ROLE)
+@bot.command(name='newgame', help='Starts a new game. XX')
+@commands.check_any(commands.has_role(ADMIN_ROLE), is_bot_author())
 @is_in_channel()
 async def game_newgame(ctx, *, initial_context=''):
     await game_save(ctx)
@@ -485,16 +539,16 @@ async def game_newgame(ctx, *, initial_context=''):
     await queue.put(json.dumps(message))
 
 
-@bot.command(name='save', help='Saves the current game')
-@commands.has_role(ADMIN_ROLE)
+@bot.command(name='save', help='Saves the current game. XX')
+@commands.check_any(commands.has_role(ADMIN_ROLE), is_bot_author())
 @is_in_channel()
 async def game_save(ctx, override_save_game_id=''):
     message = {'channel': ctx.channel.id, 'action': '__SAVE_GAME__', 'override_save_game_id': override_save_game_id}
     await queue.put(json.dumps(message))
 
 
-@bot.command(name='load', help='Load the game with given ID')
-@commands.has_role(ADMIN_ROLE)
+@bot.command(name='load', help='Load the game with given ID. XX')
+@commands.check_any(commands.has_role(ADMIN_ROLE), is_bot_author())
 @is_in_channel()
 async def game_load(ctx, *, save_game_id=''):
     if len(save_game_id) > 0:
@@ -504,8 +558,8 @@ async def game_load(ctx, *, save_game_id=''):
         await ctx.send("Please enter save file id.")
 
 
-@bot.command(name='exit', help='Saves and exits the current game')
-@commands.has_role(ADMIN_ROLE)
+@bot.command(name='exit', help='Saves and exits the current game. XX')
+@commands.check_any(commands.has_role(ADMIN_ROLE), is_bot_author())
 @is_in_channel()
 async def game_exit(ctx):
     await game_save(ctx)
@@ -513,8 +567,8 @@ async def game_exit(ctx):
     await queue.put(json.dumps(message))
 
 
-@bot.command(name='k9-join', help='Join the voice channel of the user')
-@commands.has_role(ADMIN_ROLE)
+@bot.command(name='k9-join', help='Join the voice channel of the user. XX')
+@commands.check_any(commands.has_role(ADMIN_ROLE), is_bot_author())
 @is_in_channel()
 async def join_voice(ctx):
     global voice_client
@@ -525,8 +579,8 @@ async def join_voice(ctx):
         await ctx.send("You are not currently in a voice channel")
 
 
-@bot.command(name='k9-leave', help='Join the voice channel of the user')
-@commands.has_role(ADMIN_ROLE)
+@bot.command(name='k9-leave', help='Join the voice channel of the user. XX')
+@commands.check_any(commands.has_role(ADMIN_ROLE), is_bot_author())
 @is_in_channel()
 async def leave_voice(ctx):
     global voice_client
@@ -537,8 +591,8 @@ async def leave_voice(ctx):
         await ctx.send("You are not currently in a voice channel")
 
 
-@bot.command(name='silence', help='Silences bot if any audio is currently playing')
-@commands.has_role(ADMIN_ROLE)
+@bot.command(name='silence', help='Silences bot if any audio is currently playing. XX')
+@commands.check_any(commands.has_role(ADMIN_ROLE), is_bot_author())
 @is_in_channel()
 async def silence_voice(ctx):
     global voice_client
@@ -546,8 +600,8 @@ async def silence_voice(ctx):
         voice_client.stop()
 
 
-@bot.command(name='track', help=f'Tracks stat.')
-@commands.has_role(ADMIN_ROLE)
+@bot.command(name='track', help=f'Tracks stat. XX')
+@commands.check_any(commands.has_role(ADMIN_ROLE), is_bot_author())
 @is_in_channel()
 async def track_stat(ctx, stat, amount: typing.Optional[int] = 1):
     # if stat is missing trailing 's', just add it here
@@ -577,8 +631,8 @@ def update_stats():
             f"Wholesomes: {stats['wholesomes']}")
 
 
-@bot.command(name='hello', help=f'Sets character currently playing as.')
-@commands.has_role(ADMIN_ROLE)
+@bot.command(name='hello', help=f'Sets character currently playing as. XX')
+@commands.check_any(commands.has_role(ADMIN_ROLE), is_bot_author())
 @is_in_channel()
 async def track_whoami(ctx, *, character):
     global story
@@ -602,22 +656,44 @@ def update_character_list(character):
         timestamp = datetime.now().strftime("%M:%S")
         out.write(f"\n{timestamp} - {character}")
 
+@bot.command(name='set-channel', help='Sets the bot channel XX') 
+@commands.check_any(commands.has_role(ADMIN_ROLE), is_bot_author())
+async def set_channel(ctx):
+    global CHANNEL
+    CHANNEL = ctx.message.channel.name
+    await ctx.send(f"Switched channel to {CHANNEL}")
 
-@bot.command(name='censor', help='Toggles censor (on/off)')
-@commands.has_role(ADMIN_ROLE)
+
+@bot.command(name='censor', help='Toggles censor (on/off) XX')
+@commands.check_any(commands.has_role(ADMIN_ROLE), is_bot_author())
 @is_in_channel()
 async def toggle_censor(ctx, state='on'):
     message = {'channel': ctx.channel.id, 'action': '__TOGGLE_CENSOR__', 'censor': (state == 'on')}
     await queue.put(json.dumps(message))
 
 
-@bot.command(name='toggle_v2_voice', help='Toggles between Google TTS and Microsoft TTS')
-@commands.has_role(ADMIN_ROLE)
+@bot.command(name='toggle_v2_voice', help='Toggles between Google TTS and Microsoft TTS XX')
+@commands.check_any(commands.has_role(ADMIN_ROLE), is_bot_author())
 @is_in_channel()
 async def toggle_v2_voice(ctx):
     global v2_voice_toggle
     v2_voice_toggle = not v2_voice_toggle
     await ctx.send("Using Microsoft Oprah voice" if v2_voice_toggle else "Using Google Female Voice")
+
+@bot.command(name='toggle_15ai', help='Toggles between google/microsoft and 15ai XX')
+@commands.check_any(commands.has_role(ADMIN_ROLE), is_bot_author())
+@is_in_channel()
+async def toggle_15ai(ctx):
+    global fifteen_voice_toggle
+    fifteen_voice_toggle = not fifteen_voice_toggle
+    await ctx.send("Using 15.ai" if fifteen_voice_toggle else "Using google/microsoft")
+
+@bot.command(name='15-set', help='Sets the voice for 15ai')
+@is_in_channel()
+async def set_fifteen_character(ctx, *args):
+    global fifteen_character
+    fifteen_character = " ".join(args)
+    await ctx.send(f"Switching to {fifteen_character}")
 
 
 @bot.event
