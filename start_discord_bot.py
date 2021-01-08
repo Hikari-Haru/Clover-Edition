@@ -330,7 +330,7 @@ async def bot_read_message_15ai(loop, voice_client, message):
     '''
     if voice_client and voice_client.is_connected():
         global fifteen_character
-        lines = textwrap.wrap(message, 495)
+        lines = textwrap.wrap(message, 499)
         files = {}
         output = AudioSegment.from_wav("template.wav")
         i = 0
