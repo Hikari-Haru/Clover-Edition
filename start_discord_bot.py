@@ -326,21 +326,19 @@ async def bot_read_message(voice_client, message):
 
 async def bot_read_message_15ai(loop, voice_client, message):
     '''
-    Uses 15.ai
+    Uses 15.ai, very slow
     '''
     if voice_client and voice_client.is_connected():
         global fifteen_character
         lines = textwrap.wrap(message, 499)
         files = {}
         output = AudioSegment.from_wav("template.wav")
-        i = 0
-        for line in lines:
+        for count, line in enumerate(lines):
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                results = await loop.run_in_executor(executor, tts_api.save_to_file, fifteen_character, line, f"fifteen_api_{i}.wav")
-                files.update({f"sound{i}": results["filename"]})
-                i = i + 1
+                results = await loop.run_in_executor(executor, tts_api.save_to_file, fifteen_character, line, f"fifteen_api_{count}.wav")
+                files.update({f"sound{count}": results["filename"]})
         for file in files.values():
-            output = output + AudioSegment.from_wav(file)
+            output += AudioSegment.from_wav(file)
         output.export("fifteen_api.wav")
         voice_client.play(discord.FFmpegPCMAudio(source='fifteen_api.wav', executable='ffmpeg.exe'))
         while voice_client.is_playing():
